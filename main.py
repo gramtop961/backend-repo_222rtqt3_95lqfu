@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from database import db, create_document, get_documents
+from database import db, create_document
 from schemas import Room, Participant
 
 app = FastAPI(title="AvatarMeet API")
@@ -19,6 +19,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Fallback in-memory store when database quota blocks writes (non-persistent)
+FALLBACK_ROOMS: dict[str, dict] = {}
 
 
 @app.get("/")
@@ -35,6 +38,7 @@ def test_database():
         "database_name": "❌ Not Set",
         "connection_status": "Not Connected",
         "collections": [],
+        "fallback_active": False,
     }
     try:
         if db is not None:
@@ -47,11 +51,12 @@ def test_database():
                 response["collections"] = collections[:10]
                 response["database"] = "✅ Connected & Working"
             except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
+                response["database"] = f"⚠️  Connected but Error: {str(e)[:80]}"
         else:
             response["database"] = "⚠️  Available but not initialized"
     except Exception as e:
-        response["database"] = f"❌ Error: {str(e)[:50]}"
+        response["database"] = f"❌ Error: {str(e)[:80]}"
+    response["fallback_active"] = len(FALLBACK_ROOMS) > 0
     return response
 
 
@@ -80,44 +85,99 @@ def _generate_code(length: int = 6) -> str:
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
 
+def _save_room_persistently(room: Room) -> None:
+    """Try to persist a room. If quota blocks writes, fall back to memory."""
+    try:
+        create_document("room", room)
+    except Exception as e:
+        # Quota errors from Cosmos DB (Mongo API) include Forbidden/Quota exceeded
+        if "Quota" in str(e) or "Forbidden" in str(e) or "quota" in str(e).lower():
+            FALLBACK_ROOMS[room.code] = room.model_dump()
+        else:
+            raise
+
+
+def _find_room(code: str) -> Optional[dict]:
+    # Try DB first
+    try:
+        if db is not None:
+            doc = db["room"].find_one({"code": code})
+            if doc:
+                return doc
+    except Exception:
+        pass
+    # Fallback memory
+    return FALLBACK_ROOMS.get(code)
+
+
 @app.post("/rooms", response_model=CreateRoomResponse)
 def create_room(payload: CreateRoomRequest):
-    # Generate unique code
-    for _ in range(10):
-        code = _generate_code()
-        if db["room"].find_one({"code": code}) is None:
-            break
-    else:
-        raise HTTPException(status_code=500, detail="Failed to generate unique room code")
+    try:
+        # Generate unique code
+        for _ in range(10):
+            code = _generate_code()
+            # Check both DB and fallback to ensure uniqueness
+            unique = True
+            try:
+                if db is not None and db["room"].find_one({"code": code}) is not None:
+                    unique = False
+            except Exception:
+                pass
+            if code in FALLBACK_ROOMS:
+                unique = False
+            if unique:
+                break
+        else:
+            raise RuntimeError("Failed to generate unique room code")
 
-    room = Room(code=code, scene=payload.scene or "classroom", max_participants=payload.max_participants or 16)
-    create_document("room", room)
-    return CreateRoomResponse(code=code, scene=room.scene)
+        room = Room(code=code, scene=payload.scene or "classroom", max_participants=payload.max_participants or 16)
+        _save_room_persistently(room)
+        return CreateRoomResponse(code=code, scene=room.scene)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Create room failed: {e}")
 
 
 @app.post("/rooms/join", response_model=JoinRoomResponse)
 def join_room(payload: JoinRoomRequest):
-    doc = db["room"].find_one({"code": payload.code.upper()})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Room not found")
-
-    # Optionally track participant
-    participant = Participant(room_code=payload.code.upper(), name=payload.name)
     try:
-        create_document("participant", participant)
-    except Exception:
-        pass
+        code = payload.code.upper()
+        doc = _find_room(code)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Room not found")
 
-    return JoinRoomResponse(code=doc["code"], scene=doc.get("scene", "classroom"))
+        # Optionally track participant (best-effort)
+        try:
+            participant = Participant(room_code=code, name=payload.name)
+            create_document("participant", participant)
+        except Exception:
+            pass
+
+        return JoinRoomResponse(code=code, scene=doc.get("scene", "classroom"))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Join failed: {e}")
 
 
 @app.get("/rooms/{code}")
 def get_room(code: str):
-    doc = db["room"].find_one({"code": code.upper()})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Room not found")
-    doc["_id"] = str(doc["_id"])  # make JSON serializable
-    return doc
+    try:
+        code = code.upper()
+        doc = _find_room(code)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Room not found")
+        # Make JSON serializable if from DB
+        if isinstance(doc, dict) and "_id" in doc:
+            try:
+                from bson import ObjectId  # type: ignore
+                doc["_id"] = str(doc["_id"])  # noqa: F401
+            except Exception:
+                doc.pop("_id", None)
+        return doc
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Fetch room failed: {e}")
 
 
 if __name__ == "__main__":
