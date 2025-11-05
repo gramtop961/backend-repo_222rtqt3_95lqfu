@@ -1,11 +1,7 @@
 INFO:     Will watch for changes in these directories: ['/home/workspace']
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     Started reloader process [601] using StatReload
-INFO:     Started server process [603]
+INFO:     Started reloader process [648] using StatReload
+INFO:     Started server process [650]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     172.20.0.1:58060 - "GET /rooms/RKCP4N HTTP/1.1" 404 Not Found
-INFO:     172.20.0.1:58066 - "GET /rooms/RKCP4N HTTP/1.1" 404 Not Found
-INFO:     172.20.0.1:58076 - "HEAD / HTTP/1.1" 405 Method Not Allowed
-INFO:     172.20.0.1:58074 - "GET /rooms/LTTEGH HTTP/1.1" 404 Not Found
-INFO:     172.20.0.1:58074 - "GET /rooms/LTTEGH HTTP/1.1" 404 Not Found
+INFO:     172.20.0.1:43466 - "HEAD / HTTP/1.1" 405 Method Not Allowed
